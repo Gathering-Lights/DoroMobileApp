@@ -2,7 +2,85 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Linking, Platform, KeyboardAvoidingView, ActivityIndicator } from 'react-native';
 import { Ionicons } from '@expo/vector-icons'; // For icons like microphone, phone, etc.
 import * as Speech from 'expo-speech'; // For Text-to-Speech
-import Voice from '@react-native-voice/voice'; // For Speech-to-Text
+import { WebView } from 'react-native-webview'; // For Speech-to-Text via Web Speech API
+
+// HTML content for the WebView to handle Speech-to-Text
+// This HTML uses the Web Speech API (browser's built-in speech recognition)
+const speechRecognitionHtml = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech Recognition</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        background-color: transparent; /* Make background transparent */
+        overflow: hidden; /* Hide scrollbars */
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      let recognition = null;
+      let isRecognitionActive = false;
+
+      if (SpeechRecognition) {
+        recognition = new SpeechRecognition();
+        recognition.continuous = false; // Listen for a single phrase
+        recognition.interimResults = false; // Only return final results
+        recognition.lang = 'en-US'; // Set language to US English
+
+        recognition.onstart = () => {
+          isRecognitionActive = true;
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_start' }));
+        };
+
+        recognition.onresult = (event) => {
+          const transcript = event.results[0][0].transcript;
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_result', transcript: transcript }));
+        };
+
+        recognition.onerror = (event) => {
+          isRecognitionActive = false;
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_error', error: event.error }));
+        };
+
+        recognition.onend = () => {
+          isRecognitionActive = false;
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_end' }));
+        };
+
+        // Listen for messages from React Native
+        document.addEventListener('message', (event) => {
+          const data = JSON.parse(event.data);
+          if (data.type === 'start_speech') {
+            if (recognition && !isRecognitionActive) {
+              try {
+                recognition.start();
+              } catch (e) {
+                window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_error', error: e.message }));
+              }
+            }
+          } else if (data.type === 'stop_speech') {
+            if (recognition && isRecognitionActive) {
+              recognition.stop();
+            }
+          }
+        });
+      } else {
+        window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'no_speech_api' }));
+      }
+    </script>
+  </body>
+  </html>
+`;
 
 // Main App component
 const App = () => {
@@ -12,47 +90,7 @@ const App = () => {
   const [isSpeaking, setIsSpeaking] = useState(false); // Tracks if Doro is speaking
   const [isLoading, setIsLoading] = useState(false); // For showing loading indicator during speech processing
   const scrollViewRef = useRef(null); // Ref for scrolling to the latest message
-
-  // --- Speech-to-Text (Voice Recognition) Setup ---
-  useEffect(() => {
-    // Event listener for when speech recognition starts
-    Voice.onSpeechStart = () => {
-      setIsListening(true);
-      setResponse('Listening...');
-      setIsLoading(false); // Hide loading if it was active
-    };
-
-    // Event listener for when a speech result is received
-    Voice.onSpeechResults = (event) => {
-      const transcript = event.value[0]; // Get the most confident transcript
-      setCommand(transcript);
-      processCommand(transcript);
-    };
-
-    // Event listener for speech recognition errors
-    Voice.onSpeechError = (event) => {
-      console.error('Speech recognition error:', event.error);
-      setIsListening(false);
-      setIsLoading(false);
-      setResponse(`Sorry, I couldn't understand that. Error: ${event.error.message}. Please try again.`);
-      // Speak the error message
-      Speech.speak(`Sorry, I couldn't understand that. Error: ${event.error.message}. Please try again.`, {
-        onDone: () => setIsSpeaking(false),
-        onError: () => setIsSpeaking(false),
-      });
-    };
-
-    // Event listener for when speech recognition ends
-    Voice.onSpeechEnd = () => {
-      setIsListening(false);
-      setIsLoading(false);
-    };
-
-    // Clean up Voice listeners on component unmount
-    return () => {
-      Voice.destroy().then(Voice.removeAllListeners);
-    };
-  }, []);
+  const webViewRef = useRef(null); // Ref for the WebView component
 
   // --- Text-to-Speech Setup ---
   useEffect(() => {
@@ -64,40 +102,65 @@ const App = () => {
     Speech.onError = () => setIsSpeaking(false);
   }, []);
 
-  // Function to start speech recognition
-  const startListening = async () => {
-    try {
-      setCommand(''); // Clear previous command
-      setResponse('Listening...'); // Indicate listening state
-      setIsLoading(true); // Show loading indicator
-      await Voice.start('en-US'); // Start listening in US English
-    } catch (e) {
-      console.error('Error starting speech recognition:', e);
-      setIsListening(false);
-      setIsLoading(false);
-      setResponse(`Failed to start listening: ${e.message}.`);
-      Speech.speak(`Failed to start listening: ${e.message}.`, {
-        onDone: () => setIsSpeaking(false),
-        onError: () => setIsSpeaking(false),
-      });
+  // Scroll to the bottom of the chat display when new messages appear
+  useEffect(() => {
+    scrollViewRef.current?.scrollToEnd({ animated: true });
+  }, [response, command]); // Trigger scroll when response or command changes
+
+  // Handle messages from the WebView (Speech-to-Text results)
+  const onWebViewMessage = (event) => {
+    const data = JSON.parse(event.nativeEvent.data);
+    switch (data.type) {
+      case 'speech_start':
+        setIsListening(true);
+        setResponse('Listening...');
+        setIsLoading(false);
+        break;
+      case 'speech_result':
+        const transcript = data.transcript;
+        setCommand(transcript);
+        processCommand(transcript);
+        break;
+      case 'speech_error':
+        console.error('WebView Speech recognition error:', data.error);
+        setIsListening(false);
+        setIsLoading(false);
+        setResponse(`Sorry, I couldn't understand that. Error: ${data.error}. Please try again.`);
+        Speech.speak(`Sorry, I couldn't understand that. Error: ${data.error}. Please try again.`, {
+          onDone: () => setIsSpeaking(false),
+          onError: () => setIsSpeaking(false),
+        });
+        break;
+      case 'speech_end':
+        setIsListening(false);
+        setIsLoading(false);
+        break;
+      case 'no_speech_api':
+        setResponse('Speech recognition is not supported in this WebView environment.');
+        break;
+      default:
+        break;
     }
   };
 
-  // Function to stop speech recognition
-  const stopListening = async () => {
-    try {
-      await Voice.stop();
+  // Function to start speech recognition via WebView
+  const startListening = () => {
+    if (webViewRef.current) {
+      setCommand(''); // Clear previous command
+      setResponse('Starting listening...'); // Indicate starting state
+      setIsLoading(true); // Show loading indicator
+      // Send message to WebView to start speech recognition
+      webViewRef.current.postMessage(JSON.stringify({ type: 'start_speech' }));
+    }
+  };
+
+  // Function to stop speech recognition via WebView
+  const stopListening = () => {
+    if (webViewRef.current) {
+      // Send message to WebView to stop speech recognition
+      webViewRef.current.postMessage(JSON.stringify({ type: 'stop_speech' }));
       setIsListening(false);
       setIsLoading(false);
-    } catch (e) {
-      console.error('Error stopping speech recognition:', e);
-      setIsListening(false);
-      setIsLoading(false);
-      setResponse(`Failed to stop listening: ${e.message}.`);
-      Speech.speak(`Failed to stop listening: ${e.message}.`, {
-        onDone: () => setIsSpeaking(false),
-        onError: () => setIsSpeaking(false),
-      });
     }
   };
 
@@ -187,16 +250,22 @@ const App = () => {
     }
   };
 
-  // Scroll to the bottom of the chat display when new messages appear
-  useEffect(() => {
-    scrollViewRef.current?.scrollToEnd({ animated: true });
-  }, [response, command]); // Trigger scroll when response or command changes
-
   return (
     <KeyboardAvoidingView
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
+      {/* Hidden WebView for Speech Recognition */}
+      <WebView
+        ref={webViewRef}
+        originWhitelist={['*']}
+        source={{ html: speechRecognitionHtml }}
+        onMessage={onWebViewMessage}
+        javaScriptEnabled={true}
+        domStorageEnabled={true}
+        style={styles.hiddenWebView} // Style to hide it from view
+      />
+
       <View style={styles.header}>
         <Text style={styles.headerText}>Doro</Text>
         <Ionicons name="phone-portrait-outline" size={32} color="#fff" />
@@ -222,6 +291,7 @@ const App = () => {
         {isLoading && (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color="#6366F1" />
+            <Text style={styles.loadingText}>Processing...</Text>
           </View>
         )}
       </ScrollView>
@@ -239,7 +309,7 @@ const App = () => {
         <TouchableOpacity
           style={[
             styles.micButton,
-            isListening || isSpeaking || isLoading ? styles.micButtonDisabled : null,
+            (isListening || isSpeaking || isLoading) ? styles.micButtonDisabled : null,
             isListening ? styles.micButtonActive : null,
           ]}
           onPress={isListening ? stopListening : startListening}
@@ -331,6 +401,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingVertical: 10,
   },
+  loadingText: {
+    marginTop: 8,
+    fontSize: 14,
+    color: '#6366F1',
+  },
   inputContainer: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -376,6 +451,13 @@ const styles = StyleSheet.create({
   micButtonDisabled: {
     opacity: 0.6,
     backgroundColor: '#9ca3af', // Gray-400 when disabled
+  },
+  hiddenWebView: {
+    width: 1, // Make it very small
+    height: 1, // Make it very small
+    position: 'absolute', // Position it off-screen
+    left: -1000,
+    top: -1000,
   },
 });
 
