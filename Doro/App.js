@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Linking, Platform, KeyboardAvoidingView, ActivityIndicator } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Linking, Platform, KeyboardAvoidingView, ActivityIndicator, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons'; // For icons like microphone, phone, etc.
 import * as Speech from 'expo-speech'; // For Text-to-Speech
 import { WebView } from 'react-native-webview'; // For Speech-to-Text via Web Speech API
@@ -30,6 +30,20 @@ const speechRecognitionHtml = `
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       let recognition = null;
       let isRecognitionActive = false;
+
+      // Request microphone permission for the WebView context
+      // This needs to be triggered by a user gesture for some browsers,
+      // but calling it on load is a good first step.
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(function(stream) {
+          // Microphone access granted, can proceed with speech recognition setup
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'mic_permission_granted' }));
+          stream.getTracks().forEach(track => track.stop()); // Stop the mic stream immediately after permission check
+        })
+        .catch(function(err) {
+          // Microphone access denied
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'mic_permission_denied', error: err.message }));
+        });
 
       if (SpeechRecognition) {
         recognition = new SpeechRecognition();
@@ -89,28 +103,44 @@ const App = () => {
   const [isListening, setIsListening] = useState(false); // Tracks if speech recognition is active
   const [isSpeaking, setIsSpeaking] = useState(false); // Tracks if Doro is speaking
   const [isLoading, setIsLoading] = useState(false); // For showing loading indicator during speech processing
+  const [micPermissionGranted, setMicPermissionGranted] = useState(false); // Tracks WebView mic permission
   const scrollViewRef = useRef(null); // Ref for scrolling to the latest message
   const webViewRef = useRef(null); // Ref for the WebView component
 
-  // --- Text-to-Speech Setup ---
+  // Speak initial greeting when component mounts
   useEffect(() => {
-    // Event listener for when speech synthesis starts
-    Speech.onStart = () => setIsSpeaking(true);
-    // Event listener for when speech synthesis ends
-    Speech.onDone = () => setIsSpeaking(false);
-    // Event listener for speech synthesis errors
-    Speech.onError = () => setIsSpeaking(false);
-  }, []);
+    Speech.speak(response, {
+      onDone: () => setIsSpeaking(false),
+      onError: (error) => {
+        console.error('Initial greeting speech error:', error);
+        setIsSpeaking(false);
+      },
+    });
+  }, []); // Run once on mount
 
   // Scroll to the bottom of the chat display when new messages appear
   useEffect(() => {
     scrollViewRef.current?.scrollToEnd({ animated: true });
   }, [response, command]); // Trigger scroll when response or command changes
 
-  // Handle messages from the WebView (Speech-to-Text results)
+  // Handle messages from the WebView (Speech-to-Text results and permissions)
   const onWebViewMessage = (event) => {
     const data = JSON.parse(event.nativeEvent.data);
     switch (data.type) {
+      case 'mic_permission_granted':
+        setMicPermissionGranted(true);
+        console.log('WebView Microphone permission granted.');
+        break;
+      case 'mic_permission_denied':
+        setMicPermissionGranted(false);
+        setResponse(`Microphone permission denied for speech recognition: ${data.error}. Please ensure it's allowed.`);
+        console.error('WebView Microphone permission denied:', data.error);
+        Alert.alert(
+          "Microphone Permission Required",
+          "Doro needs microphone access to understand your voice commands. Please ensure you allow microphone access for this app in your phone's settings.",
+          [{ text: "OK" }]
+        );
+        break;
       case 'speech_start':
         setIsListening(true);
         setResponse('Listening...');
@@ -145,12 +175,19 @@ const App = () => {
 
   // Function to start speech recognition via WebView
   const startListening = () => {
-    if (webViewRef.current) {
+    if (webViewRef.current && micPermissionGranted) {
       setCommand(''); // Clear previous command
       setResponse('Starting listening...'); // Indicate starting state
       setIsLoading(true); // Show loading indicator
       // Send message to WebView to start speech recognition
       webViewRef.current.postMessage(JSON.stringify({ type: 'start_speech' }));
+    } else if (!micPermissionGranted) {
+      setResponse("Microphone permission not granted. Please allow it for Doro to listen.");
+      Alert.alert(
+        "Microphone Permission Required",
+        "Doro needs microphone access to understand your voice commands. Please ensure you allow microphone access for this app in your phone's settings.",
+        [{ text: "OK" }]
+      );
     }
   };
 
@@ -239,7 +276,10 @@ const App = () => {
     // Speak the response
     Speech.speak(newResponse, {
       onDone: () => setIsSpeaking(false),
-      onError: () => setIsSpeaking(false),
+      onError: (error) => { // Use the onError callback directly here
+        console.error('Speech synthesis error:', error);
+        setIsSpeaking(false);
+      },
     });
   };
 
@@ -309,11 +349,11 @@ const App = () => {
         <TouchableOpacity
           style={[
             styles.micButton,
-            (isListening || isSpeaking || isLoading) ? styles.micButtonDisabled : null,
+            (isListening || isSpeaking || isLoading || !micPermissionGranted) ? styles.micButtonDisabled : null,
             isListening ? styles.micButtonActive : null,
           ]}
           onPress={isListening ? stopListening : startListening}
-          disabled={isSpeaking || isLoading} // Disable button while Doro is speaking or loading
+          disabled={isSpeaking || isLoading || !micPermissionGranted} // Disable button while Doro is speaking or loading or no mic
         >
           {isListening ? (
             <Ionicons name="mic-off" size={28} color="#fff" />
