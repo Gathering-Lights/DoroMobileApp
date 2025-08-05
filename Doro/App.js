@@ -3,9 +3,12 @@ import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Linkin
 import { Ionicons } from '@expo/vector-icons'; // For icons like microphone, phone, etc.
 import * as Speech from 'expo-speech'; // For Text-to-Speech
 import { WebView } from 'react-native-webview'; // For Speech-to-Text via Web Speech API
+import * as Contacts from 'expo-contacts'; // For accessing phone contacts
+import { Audio } from 'expo-av'; // For requesting native microphone permission
 
 // HTML content for the WebView to handle Speech-to-Text
-// This HTML uses the Web Speech API (browser's built-in speech recognition)
+// This HTML will no longer call getUserMedia on load.
+// It will expose a function to trigger SpeechRecognition.start()
 const speechRecognitionHtml = `
   <!DOCTYPE html>
   <html>
@@ -31,20 +34,6 @@ const speechRecognitionHtml = `
       let recognition = null;
       let isRecognitionActive = false;
 
-      // Request microphone permission for the WebView context
-      // This needs to be triggered by a user gesture for some browsers,
-      // but calling it on load is a good first step.
-      navigator.mediaDevices.getUserMedia({ audio: true })
-        .then(function(stream) {
-          // Microphone access granted, can proceed with speech recognition setup
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'mic_permission_granted' }));
-          stream.getTracks().forEach(track => track.stop()); // Stop the mic stream immediately after permission check
-        })
-        .catch(function(err) {
-          // Microphone access denied
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'mic_permission_denied', error: err.message }));
-        });
-
       if (SpeechRecognition) {
         recognition = new SpeechRecognition();
         recognition.continuous = false; // Listen for a single phrase
@@ -53,42 +42,53 @@ const speechRecognitionHtml = `
 
         recognition.onstart = () => {
           isRecognitionActive = true;
+          console.log('WebView: Speech recognition started.');
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_start' }));
         };
 
         recognition.onresult = (event) => {
           const transcript = event.results[0][0].transcript;
+          console.log('WebView: Speech result:', transcript);
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_result', transcript: transcript }));
         };
 
         recognition.onerror = (event) => {
           isRecognitionActive = false;
+          console.error('WebView: Speech recognition error:', event.error);
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_error', error: event.error }));
         };
 
         recognition.onend = () => {
           isRecognitionActive = false;
+          console.log('WebView: Speech recognition ended.');
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_end' }));
         };
 
-        // Listen for messages from React Native
-        document.addEventListener('message', (event) => {
-          const data = JSON.parse(event.data);
-          if (data.type === 'start_speech') {
-            if (recognition && !isRecognitionActive) {
-              try {
-                recognition.start();
-              } catch (e) {
-                window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_error', error: e.message }));
-              }
+        // Function exposed to React Native to start recognition
+        window.startWebViewSpeechRecognition = () => {
+          if (recognition && !isRecognitionActive) {
+            try {
+              console.log('WebView: Attempting to start recognition via exposed function.');
+              recognition.start(); // This will implicitly trigger getUserMedia
+            } catch (e) {
+              console.error('WebView: Error starting recognition (exposed func):', e.message);
+              window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_error', error: e.message }));
             }
-          } else if (data.type === 'stop_speech') {
-            if (recognition && isRecognitionActive) {
-              recognition.stop();
-            }
+          } else {
+            console.log('WebView: Recognition already active or not initialized (exposed func).');
           }
-        });
+        };
+
+        // Function exposed to React Native to stop recognition
+        window.stopWebViewSpeechRecognition = () => {
+          if (recognition && isRecognitionActive) {
+            console.log('WebView: Attempting to stop recognition via exposed function.');
+            recognition.stop();
+          }
+        };
+
       } else {
+        console.log('WebView: Web Speech API not supported.');
         window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'no_speech_api' }));
       }
     </script>
@@ -98,14 +98,16 @@ const speechRecognitionHtml = `
 
 // Main App component
 const App = () => {
-  const [command, setCommand] = useState(''); // Stores the user's spoken or typed command
-  const [response, setResponse] = useState('Hello! I am Doro. How can I help you today?'); // Stores Doro's response
-  const [isListening, setIsListening] = useState(false); // Tracks if speech recognition is active
-  const [isSpeaking, setIsSpeaking] = useState(false); // Tracks if Doro is speaking
-  const [isLoading, setIsLoading] = useState(false); // For showing loading indicator during speech processing
-  const [micPermissionGranted, setMicPermissionGranted] = useState(false); // Tracks WebView mic permission
-  const scrollViewRef = useRef(null); // Ref for scrolling to the latest message
-  const webViewRef = useRef(null); // Ref for the WebView component
+  const [command, setCommand] = useState('');
+  const [response, setResponse] = useState('Hello! I am Doro. How can I help you today?');
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [webViewMicPermissionGranted, setWebViewMicPermissionGranted] = useState(false); // Tracks WebView mic permission
+  const [nativeMicPermissionGranted, setNativeMicPermissionGranted] = useState(false); // Tracks native app mic permission
+  const [contactsPermissionGranted, setContactsPermissionGranted] = useState(false); // Tracks Contacts permission
+  const scrollViewRef = useRef(null);
+  const webViewRef = useRef(null);
 
   // Speak initial greeting when component mounts
   useEffect(() => {
@@ -116,31 +118,83 @@ const App = () => {
         setIsSpeaking(false);
       },
     });
+  }, []);
+
+  // Request Native Microphone and Contacts permissions when component mounts
+  useEffect(() => {
+    (async () => {
+      // Request Native Microphone Permission
+      const { status: micStatus } = await Audio.requestPermissionsAsync();
+      if (micStatus === 'granted') {
+        setNativeMicPermissionGranted(true);
+        console.log('App: Native microphone permission granted.');
+      } else {
+        setNativeMicPermissionGranted(false);
+        Alert.alert(
+          "Microphone Permission Required",
+          "Doro needs microphone access to listen to your commands. Please enable it in your phone's settings.",
+          [{ text: "OK" }]
+        );
+        console.warn('App: Native microphone permission denied.');
+      }
+
+      // Request Contacts Permission
+      const { status: contactsStatus } = await Contacts.requestPermissionsAsync();
+      if (contactsStatus === 'granted') {
+        setContactsPermissionGranted(true);
+        console.log('App: Contacts permission granted.');
+      } else {
+        setContactsPermissionGranted(false);
+        Alert.alert(
+          "Contacts Permission Required",
+          "Doro needs access to your contacts to call people by name. Please enable contacts permission in your phone's settings.",
+          [{ text: "OK" }]
+        );
+        console.warn('App: Contacts permission denied.');
+      }
+    })();
   }, []); // Run once on mount
 
   // Scroll to the bottom of the chat display when new messages appear
   useEffect(() => {
     scrollViewRef.current?.scrollToEnd({ animated: true });
-  }, [response, command]); // Trigger scroll when response or command changes
+  }, [response, command]);
 
-  // Handle messages from the WebView (Speech-to-Text results and permissions)
-  const onWebViewMessage = (event) => {
-    const data = JSON.parse(event.nativeEvent.data);
-    switch (data.type) {
-      case 'mic_permission_granted':
-        setMicPermissionGranted(true);
-        console.log('WebView Microphone permission granted.');
-        break;
-      case 'mic_permission_denied':
-        setMicPermissionGranted(false);
-        setResponse(`Microphone permission denied for speech recognition: ${data.error}. Please ensure it's allowed.`);
-        console.error('WebView Microphone permission denied:', data.error);
+  // Handle permission requests from the WebView
+  const onWebViewPermissionRequest = (syntheticEvent) => {
+    const { nativeEvent } = syntheticEvent;
+    const { url, permissions, resources } = nativeEvent; // 'resources' might contain the specific media type
+
+    console.log('App: onPermissionRequest triggered for URL:', url);
+    console.log('App: Permissions requested:', permissions);
+    console.log('App: Resources requested:', resources); // Check this for 'microphone'
+
+    // Check if the request is for microphone and if native mic permission is granted
+    if (permissions.includes('microphone') || (resources && resources.includes('microphone'))) {
+      if (nativeMicPermissionGranted) {
+        syntheticEvent.preventDefault(); // Prevent default browser prompt
+        nativeEvent.grant(); // Grant the permission
+        setWebViewMicPermissionGranted(true); // Update state
+        console.log('App: WebView microphone permission granted via onPermissionRequest.');
+      } else {
+        syntheticEvent.preventDefault();
+        nativeEvent.deny();
+        setWebViewMicPermissionGranted(false);
+        console.warn('App: WebView microphone permission denied because native mic permission is not granted.');
         Alert.alert(
           "Microphone Permission Required",
-          "Doro needs microphone access to understand your voice commands. Please ensure you allow microphone access for this app in your phone's settings.",
+          "Doro needs native microphone access to enable voice commands. Please enable it in your phone's settings.",
           [{ text: "OK" }]
         );
-        break;
+      }
+    }
+  };
+
+  // Handle messages from the WebView (Speech-to-Text results and internal WebView status)
+  const onWebViewMessage = (event) => {
+    const data = JSON.parse(event.nativeEvent.data);
+    console.log('App: Received message from WebView:', data.type); // Log all incoming messages
+    switch (data.type) {
       case 'speech_start':
         setIsListening(true);
         setResponse('Listening...');
@@ -152,7 +206,7 @@ const App = () => {
         processCommand(transcript);
         break;
       case 'speech_error':
-        console.error('WebView Speech recognition error:', data.error);
+        console.error('App: WebView Speech recognition error:', data.error);
         setIsListening(false);
         setIsLoading(false);
         setResponse(`Sorry, I couldn't understand that. Error: ${data.error}. Please try again.`);
@@ -167,6 +221,8 @@ const App = () => {
         break;
       case 'no_speech_api':
         setResponse('Speech recognition is not supported in this WebView environment.');
+        setIsLoading(false);
+        setIsListening(false);
         break;
       default:
         break;
@@ -175,27 +231,46 @@ const App = () => {
 
   // Function to start speech recognition via WebView
   const startListening = () => {
-    if (webViewRef.current && micPermissionGranted) {
+    console.log('App: Microphone button pressed.');
+    // Check both native and WebView microphone permissions
+    if (nativeMicPermissionGranted && webViewRef.current) {
       setCommand(''); // Clear previous command
       setResponse('Starting listening...'); // Indicate starting state
       setIsLoading(true); // Show loading indicator
-      // Send message to WebView to start speech recognition
-      webViewRef.current.postMessage(JSON.stringify({ type: 'start_speech' }));
-    } else if (!micPermissionGranted) {
-      setResponse("Microphone permission not granted. Please allow it for Doro to listen.");
+      // Inject JavaScript into WebView to trigger speech recognition
+      webViewRef.current.injectJavaScript(`
+        if (window.startWebViewSpeechRecognition) {
+          window.startWebViewSpeechRecognition();
+        } else {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'speech_error', error: 'WebView function not ready.' }));
+        }
+      `);
+    } else {
+      let message = "Doro cannot listen right now.";
+      if (!nativeMicPermissionGranted) {
+        message += " Native microphone permission is denied. Please enable it in settings.";
+      } else {
+        message += " WebView microphone permission is not yet granted or Web Speech API is not ready.";
+      }
+      setResponse(message);
       Alert.alert(
-        "Microphone Permission Required",
-        "Doro needs microphone access to understand your voice commands. Please ensure you allow microphone access for this app in your phone's settings.",
+        "Microphone Not Ready",
+        message,
         [{ text: "OK" }]
       );
+      setIsLoading(false); // Stop loading immediately if permissions not granted
     }
   };
 
   // Function to stop speech recognition via WebView
   const stopListening = () => {
     if (webViewRef.current) {
-      // Send message to WebView to stop speech recognition
-      webViewRef.current.postMessage(JSON.stringify({ type: 'stop_speech' }));
+      console.log('App: Stopping listening.');
+      webViewRef.current.injectJavaScript(`
+        if (window.stopWebViewSpeechRecognition) {
+          window.stopWebViewSpeechRecognition();
+        }
+      `);
       setIsListening(false);
       setIsLoading(false);
     }
@@ -209,74 +284,80 @@ const App = () => {
     if (lowerCmd.includes('hello') || lowerCmd.includes('hi doro')) {
       newResponse = 'Hello there! How can I assist you?';
     } else if (lowerCmd.includes('call')) {
-      const contactMatch = lowerCmd.match(/call\s+(.+)/);
-      if (contactMatch && contactMatch[1]) {
-        const contact = contactMatch[1].trim();
-        newResponse = `Attempting to call ${contact}... (This will open your phone's dialer if a number is detected.)`;
-        // Attempt to open the phone dialer
-        const phoneNumber = contact.replace(/\D/g, ''); // Extract digits only
-        if (phoneNumber.length > 0) {
-          Linking.openURL(`tel:${phoneNumber}`).catch(err => {
-            console.error('Failed to open dialer:', err);
-            setResponse(`Could not open dialer for ${contact}. Please check the number.`);
-            Speech.speak(`Could not open dialer for ${contact}. Please check the number.`, {
+      const callMatch = lowerCmd.match(/call\s+(.+)/);
+      if (callMatch && callMatch[1]) {
+        const target = callMatch[1].trim(); // Could be a name or a number
+
+        // Check if it's likely a phone number (contains digits)
+        const phoneNumberDigits = target.replace(/\D/g, '');
+        if (phoneNumberDigits.length >= 7 && /^\d+$/.test(phoneNumberDigits)) { // More robust number check
+          newResponse = `Attempting to call ${target}... (Opening dialer. Please tap 'Call' to confirm.)`;
+          Linking.openURL(`tel:${phoneNumberDigits}`).catch(err => {
+            console.error('Failed to open dialer for number:', err);
+            setResponse(`Could not open dialer for ${target}. Please check the number.`);
+            Speech.speak(`Could not open dialer for ${target}. Please check the number.`, {
               onDone: () => setIsSpeaking(false),
               onError: () => setIsSpeaking(false),
             });
           });
+        } else if (contactsPermissionGranted) {
+          // Attempt to find contact by name
+          newResponse = `Searching for ${target} in your contacts...`;
+          setResponse(newResponse); // Update response while searching
+          Speech.speak(newResponse, {
+            onDone: () => setIsSpeaking(false),
+            onError: () => setIsSpeaking(false),
+          });
+
+          try {
+            const { data } = await Contacts.getContactsAsync({
+              fields: [Contacts.Fields.PhoneNumbers, Contacts.Fields.Name],
+              name: target, // Filter by name
+            });
+
+            if (data.length > 0) {
+              const foundContact = data[0]; // Take the first match
+              if (foundContact.phoneNumbers && foundContact.phoneNumbers.length > 0) {
+                const numberToCall = foundContact.phoneNumbers[0].number;
+                newResponse = `Found ${foundContact.name}. Calling ${numberToCall}... (Opening dialer. Please tap 'Call' to confirm.)`;
+                Linking.openURL(`tel:${numberToCall}`).catch(err => {
+                  console.error('Failed to open dialer for contact:', err);
+                  setResponse(`Could not open dialer for ${foundContact.name}.`);
+                  Speech.speak(`Could not open dialer for ${foundContact.name}.`, {
+                    onDone: () => setIsSpeaking(false),
+                    onError: () => setIsSpeaking(false),
+                  });
+                });
+              } else {
+                newResponse = `Found ${foundContact.name}, but no phone number available.`;
+              }
+            } else {
+              newResponse = `Could not find a contact named ${target}. Please try again or say the number.`;
+            }
+          } catch (error) {
+            console.error('Error fetching contacts:', error);
+            newResponse = `An error occurred while searching contacts: ${error.message}.`;
+          }
         } else {
-          newResponse = `Could not find a valid number for ${contact}. Please specify a number or a contact with a known number.`;
+          newResponse = `To call by name, I need contacts permission. Please enable it in settings.`;
+          Alert.alert(
+            "Contacts Permission Required",
+            "Doro needs access to your contacts to call people by name. Please enable contacts permission in your phone's settings.",
+            [{ text: "OK" }]
+          );
         }
       } else {
         newResponse = 'Whom would you like me to call? Please say "call [name or number]".';
       }
-    } else if (lowerCmd.includes('open')) {
-      const appMatch = lowerCmd.match(/open\s+(.+)/);
-      if (appMatch && appMatch[1]) {
-        const appName = appMatch[1].trim();
-        // This is a simplified simulation. Actual app opening requires deep linking
-        // which varies greatly by app and platform.
-        newResponse = `Simulating opening ${appName}... (Actual app launch depends on deep link availability.)`;
-        // Example of deep linking (e.g., to open YouTube app)
-        if (appName.includes('youtube')) {
-          Linking.openURL('vnd.youtube://').catch(() => {
-            Linking.openURL('https://m.youtube.com'); // Fallback to web
-          });
-        } else if (appName.includes('settings')) {
-          // Open device settings (Android specific, may vary)
-          if (Platform.OS === 'android') {
-            Linking.openSettings().catch(() => {
-              console.log('Could not open Android settings directly.');
-            });
-          } else {
-            newResponse += " Opening settings is not directly supported on iOS via deep link.";
-          }
-        } else {
-          newResponse += " I can only simulate opening common apps or use specific deep links.";
-        }
-      } else {
-        newResponse = 'Which application would you like me to open? Please say "open [app name]".';
-      }
-    } else if (lowerCmd.includes('what is the time') || lowerCmd.includes('current time')) {
-      const now = new Date();
-      newResponse = `The current time is ${now.toLocaleTimeString()}.`;
-    } else if (lowerCmd.includes('what is the date') || lowerCmd.includes('current date')) {
-      const now = new Date();
-      newResponse = `Today's date is ${now.toLocaleDateString()}.`;
-    } else if (lowerCmd.includes('thank you') || lowerCmd.includes('thanks')) {
-      newResponse = 'You\'re welcome! Is there anything else?';
-    } else if (lowerCmd.includes('goodbye') || lowerCmd.includes('bye')) {
-      newResponse = 'Goodbye! Have a great day!';
-    } else {
-      newResponse = "I'm not sure how to handle that command. Can you please rephrase?";
+    } else { // Removed 'open' commands to focus on calling
+      newResponse = "I'm currently focused on making calls. How can I help you with a call?";
     }
 
-    setResponse(newResponse); // Update the displayed response
-    setIsLoading(false); // Hide loading indicator
-    // Speak the response
+    setResponse(newResponse);
+    setIsLoading(false);
     Speech.speak(newResponse, {
       onDone: () => setIsSpeaking(false),
-      onError: (error) => { // Use the onError callback directly here
+      onError: (error) => {
         console.error('Speech synthesis error:', error);
         setIsSpeaking(false);
       },
@@ -289,6 +370,10 @@ const App = () => {
       processCommand(command);
     }
   };
+
+  // Determine if the mic button should be disabled
+  // It requires both native mic permission AND the WebView's mic permission
+  const isMicButtonDisabled = isSpeaking || isLoading || !nativeMicPermissionGranted || !webViewMicPermissionGranted;
 
   return (
     <KeyboardAvoidingView
@@ -303,6 +388,15 @@ const App = () => {
         onMessage={onWebViewMessage}
         javaScriptEnabled={true}
         domStorageEnabled={true}
+        // NEW: Handle permission requests from the WebView
+        onPermissionRequest={onWebViewPermissionRequest}
+        // Add onLoad and onLoadEnd to debug WebView loading
+        onLoad={() => console.log('App: WebView finished loading HTML content.')}
+        onLoadEnd={() => console.log('App: WebView finished loading (including subframes).')}
+        onError={(syntheticEvent) => {
+          const { nativeEvent } = syntheticEvent;
+          console.error('App: WebView error:', nativeEvent.description);
+        }}
         style={styles.hiddenWebView} // Style to hide it from view
       />
 
@@ -349,11 +443,11 @@ const App = () => {
         <TouchableOpacity
           style={[
             styles.micButton,
-            (isListening || isSpeaking || isLoading || !micPermissionGranted) ? styles.micButtonDisabled : null,
+            isMicButtonDisabled ? styles.micButtonDisabled : null,
             isListening ? styles.micButtonActive : null,
           ]}
           onPress={isListening ? stopListening : startListening}
-          disabled={isSpeaking || isLoading || !micPermissionGranted} // Disable button while Doro is speaking or loading or no mic
+          disabled={isMicButtonDisabled} // Use the derived state
         >
           {isListening ? (
             <Ionicons name="mic-off" size={28} color="#fff" />
@@ -361,6 +455,18 @@ const App = () => {
             <Ionicons name="mic" size={28} color="#fff" />
           )}
         </TouchableOpacity>
+      </View>
+      {/* Debugging indicator for microphone permission */}
+      <View style={styles.permissionStatusContainer}>
+        <Text style={styles.permissionStatusText}>
+          Native Mic: {nativeMicPermissionGranted ? 'Granted ✅' : 'Denied ❌'}
+        </Text>
+        <Text style={styles.permissionStatusText}>
+          WebView Mic: {webViewMicPermissionGranted ? 'Granted ✅' : 'Denied ❌'}
+        </Text>
+        <Text style={styles.permissionStatusText}>
+          Contacts: {contactsPermissionGranted ? 'Granted ✅' : 'Denied ❌'}
+        </Text>
       </View>
     </KeyboardAvoidingView>
   );
@@ -498,6 +604,22 @@ const styles = StyleSheet.create({
     position: 'absolute', // Position it off-screen
     left: -1000,
     top: -1000,
+  },
+  permissionStatusContainer: {
+    padding: 8,
+    backgroundColor: '#e0e0e0',
+    borderTopWidth: 1,
+    borderColor: '#d0d0d0',
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    flexWrap: 'wrap', // Allow text to wrap if too long
+  },
+  permissionStatusText: {
+    fontSize: 11, // Smaller font for status
+    color: '#444',
+    marginHorizontal: 5,
+    marginBottom: 2,
   },
 });
 
